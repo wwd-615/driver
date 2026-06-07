@@ -1,11 +1,5 @@
 # simple-drm 驱动示例
 
-这是一个用于教学和测试的最简 DRM 驱动示例（`simple-drm`）。
-
-## 要求
-- 与用于编译的内核相同版本的运行内核（请确保 `KERNELDIR` 指向正确的内核源码/headers）。
-- root 权限用于加载/卸载模块。
-
 ## 构建
 ```bash
 cd drm_driver
