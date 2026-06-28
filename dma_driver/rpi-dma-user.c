@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Simple BCM2835 I2S static sample playback driver
- *
- * This driver configures the BCM2835 PCM/I2S block and repeatedly writes
- * an embedded sample buffer to the I2S transmit FIFO.
- *
- * It is intended as a self-contained example driver that plays static
- * audio data through the BCM2835 I2S interface without a full ALSA PCM
- * user-space playback pipeline.
+ * rpi-dma-user.c
+ * 使用dma进行音频播放demo
+ * author：wwd
+ * 主要特性：
+ * - 使用dmaengine进行音频数据传输
+ * - 使用dma_alloc_coherent申请dma缓冲区
+ * - 使用dma_request_slave_channel申请dma通道
+ * - 使用dmaengine_prep_slave_single准备dma传输描述符
+ * - 使用dmaengine_submit提交dma传输事务
+ * - 使用dma_async_issue_pending启动dma传输
  */
 
 #include <linux/clk.h>
@@ -98,16 +100,14 @@ struct bcm2835_i2s_static_dev {
 	bool clk_prepared;
 	unsigned int clk_rate;
 	struct mutex lock;
-	struct delayed_work work;
 	unsigned int sample_frame;
 	bool playback_enabled;
-	/* DMA fields */
+
 	struct dma_chan *tx_chan;
 	void *dma_buf;
 	dma_addr_t dma_addr;
 	size_t dma_size;
 	dma_cookie_t dma_cookie;
-	struct completion dma_complete;
 };
 
 static void bcm2835_i2s_static_start_clock(struct bcm2835_i2s_static_dev *dev)
@@ -135,47 +135,6 @@ static void bcm2835_i2s_static_clear_fifos(struct bcm2835_i2s_static_dev *dev)
 			BCM2835_I2S_TXCLR | BCM2835_I2S_RXCLR);
 }
 
-static void bcm2835_i2s_static_fill_fifo(struct bcm2835_i2s_static_dev *dev)
-{
-	uint32_t cs;
-	unsigned int written = 0;
-
-	while (written < 8) {
-		if (regmap_read(dev->i2s_regmap, BCM2835_I2S_CS_A_REG, &cs))
-		break;
-
-		if (!(cs & BCM2835_I2S_TXW))
-		break;
-
-		uint16_t left = sample_data[dev->sample_frame * SAMPLE_CHANNELS];
-		uint16_t right = sample_data[dev->sample_frame * SAMPLE_CHANNELS + 1];
-		uint32_t fifo_word = (uint32_t)(uint16_t)left |
-					((uint32_t)(uint16_t)right << 16);
-
-		regmap_write(dev->i2s_regmap, BCM2835_I2S_FIFO_A_REG, fifo_word);
-
-		dev->sample_frame++;
-		if (dev->sample_frame >= SAMPLE_FRAME_COUNT)
-		dev->sample_frame = 0;
-
-		written++;
-	}
-}
-
-static void bcm2835_i2s_static_playback_work(struct work_struct *work)
-{
-	struct bcm2835_i2s_static_dev *dev = container_of(to_delayed_work(work),
-							struct bcm2835_i2s_static_dev,
-							work);
-
-	mutex_lock(&dev->lock);
-	if (dev->playback_enabled) {
-		bcm2835_i2s_static_fill_fifo(dev);
-		schedule_delayed_work(&dev->work, msecs_to_jiffies(2));
-	}
-	mutex_unlock(&dev->lock);
-}
-
 static void bcm2835_i2s_static_dma_complete(void *param)
 {
 	struct bcm2835_i2s_static_dev *dev = param;
@@ -187,9 +146,6 @@ static void bcm2835_i2s_static_dma_complete(void *param)
 	regmap_update_bits(dev->i2s_regmap, BCM2835_I2S_CS_A_REG,
 			BCM2835_I2S_TXON | BCM2835_I2S_EN | BCM2835_I2S_STBY,
 			0);
-	bcm2835_i2s_static_stop_clock(dev);
-
-	complete(&dev->dma_complete);
 
 	dev_info(dev->dev, "BCM2835 I2S DMA playback complete\n");
 }
@@ -246,11 +202,27 @@ static int bcm2835_i2s_static_configure(struct bcm2835_i2s_static_dev *dev)
 	return 0;
 }
 
+void fill_dma_buffer(struct bcm2835_i2s_static_dev *dev)
+{
+	uint32_t *p = dev->dma_buf;
+	int i;
+
+	for (i = 0; i < STOP_FRAME_COUNT; i++) {
+		int src_idx = (i % SAMPLE_FRAME_COUNT) * SAMPLE_CHANNELS;
+		int16_t left = sample_data[src_idx];
+		int16_t right = sample_data[src_idx + 1];
+		p[i] = (uint32_t)(uint16_t)left | ((uint32_t)(uint16_t)right << 16);
+	}
+}
+
 static int bcm2835_i2s_static_probe(struct platform_device *pdev)
 {
+	struct dma_async_tx_descriptor *desc;
 	struct bcm2835_i2s_static_dev *dev;
-	void __iomem *base;
+	struct dma_slave_config cfg = { 0 };
 	struct resource *res;
+	struct resource *mem;
+	void __iomem *base;
 	int ret;
 
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
@@ -259,14 +231,12 @@ static int bcm2835_i2s_static_probe(struct platform_device *pdev)
 
 	dev->dev = &pdev->dev;
 	mutex_init(&dev->lock);
-	INIT_DELAYED_WORK(&dev->work, bcm2835_i2s_static_playback_work);
 	dev->clk_prepared = false;
 	dev->sample_frame = 0;
 
 	dev->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(dev->clk))
-		return dev_err_probe(&pdev->dev, PTR_ERR(dev->clk),
-				"could not get clk\n");
+		return dev_err_probe(&pdev->dev, PTR_ERR(dev->clk), "could not get clk\n");
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
@@ -284,8 +254,7 @@ static int bcm2835_i2s_static_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/* Prepare DMA one-shot buffer for STOP_FRAME_COUNT frames */
-	init_completion(&dev->dma_complete);
+	// 申请dma缓冲区
 	dev->dma_size = STOP_FRAME_COUNT * SAMPLE_CHANNELS * (SAMPLE_WIDTH_BITS / 8);
 	dev->dma_buf = dma_alloc_coherent(dev->dev, dev->dma_size, &dev->dma_addr, GFP_KERNEL);
 	if (!dev->dma_buf) {
@@ -293,81 +262,57 @@ static int bcm2835_i2s_static_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	/* Fill DMA buffer with repeated sample pattern */
-	{
-		uint32_t *p = dev->dma_buf;
-		int i;
+	fill_dma_buffer(dev);
 
-		for (i = 0; i < STOP_FRAME_COUNT; i++) {
-		int src_idx = (i % SAMPLE_FRAME_COUNT) * SAMPLE_CHANNELS;
-		int16_t left = sample_data[src_idx];
-		int16_t right = sample_data[src_idx + 1];
-		p[i] = (uint32_t)(uint16_t)left | ((uint32_t)(uint16_t)right << 16);
-		}
-	}
-
-	/* Request TX DMA channel (OF dma binding should provide "tx") */
+	// 申请dma通道
 	dev->tx_chan = dma_request_slave_channel(dev->dev, "tx");
 	if (!dev->tx_chan) {
-		dev_warn(&pdev->dev,
-			 "tx DMA channel unavailable, falling back to FIFO playback\n");
-		dev->playback_enabled = true;
-		schedule_delayed_work(&dev->work, msecs_to_jiffies(2));
+		dev_err(&pdev->dev, "tx DMA channel unavailable, falling back to FIFO playback\n");
 		goto out;
 	}
 
-	/* Configure slave DMA */
-	{
-		struct dma_slave_config cfg = { 0 };
-		struct resource *mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	// 配置dma通道
+	cfg.direction = DMA_MEM_TO_DEV;
+	cfg.dst_addr = res->start + BCM2835_I2S_FIFO_A_REG;
+	cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	cfg.dst_maxburst = 2;
+	cfg.src_maxburst = 2;
 
-		if (!mem) {
-			ret = -ENODEV;
-			dev_err(&pdev->dev, "missing I2S MMIO resource\n");
-			goto err_release_chan;
-		}
-
-		cfg.direction = DMA_MEM_TO_DEV;
-		cfg.dst_addr = mem->start + BCM2835_I2S_FIFO_A_REG;
-		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
-		cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
-		cfg.dst_maxburst = 2;
-		cfg.src_maxburst = 2;
-
-		ret = dmaengine_slave_config(dev->tx_chan, &cfg);
-		if (ret) {
-			dev_err(&pdev->dev, "dmaengine_slave_config failed: %d\n", ret);
-			goto err_release_chan;
-		}
+	ret = dmaengine_slave_config(dev->tx_chan, &cfg);
+	if (ret) {
+		dev_err(&pdev->dev, "dmaengine_slave_config failed: %d\n", ret);
+		goto err_release_chan;
 	}
 
-	/* Prepare and submit a one-shot DMA transfer */
-	{
-		struct dma_async_tx_descriptor *desc;
 
-		desc = dmaengine_prep_slave_single(dev->tx_chan, dev->dma_addr,
-						dev->dma_size, DMA_MEM_TO_DEV,
-						DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-		if (!desc) {
-			dev_err(&pdev->dev, "dmaengine_prep_slave_single failed\n");
-			ret = -ENOMEM;
-			goto err_release_chan;
-		}
-
-		desc->callback = bcm2835_i2s_static_dma_complete;
-		desc->callback_param = dev;
-
-		dev->dma_cookie = dmaengine_submit(desc);
-		if (dma_submit_error(dev->dma_cookie)) {
-			dev_err(&pdev->dev, "dmaengine_submit failed\n");
-			ret = -EIO;
-			goto err_release_chan;
-		}
-
-		/* Start DMA and enable TX */
-		dma_async_issue_pending(dev->tx_chan);
-		dev->playback_enabled = true;
+	// 准备dma传输描述符
+	desc = dmaengine_prep_slave_single(dev->tx_chan, dev->dma_addr,
+					dev->dma_size, DMA_MEM_TO_DEV,
+					DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc) {
+		dev_err(&pdev->dev, "dmaengine_prep_slave_single failed\n");
+		ret = -ENOMEM;
+		goto err_release_chan;
 	}
+
+	// 设置dma传输完成回调函数
+	desc->callback = bcm2835_i2s_static_dma_complete;
+	desc->callback_param = dev;
+
+
+	// 提交dma传输事务
+	dev->dma_cookie = dmaengine_submit(desc);
+	if (dma_submit_error(dev->dma_cookie)) {
+		dev_err(&pdev->dev, "dmaengine_submit failed\n");
+		ret = -EIO;
+		goto err_release_chan;
+	}
+
+	// 启动dma传输
+	dma_async_issue_pending(dev->tx_chan);
+	dev->playback_enabled = true;
+
 
 out:
 	dev_info(&pdev->dev, "BCM2835 I2S static playback driver loaded\n");
@@ -390,13 +335,11 @@ static int bcm2835_i2s_static_remove(struct platform_device *pdev)
 	dev->playback_enabled = false;
 	mutex_unlock(&dev->lock);
 
-	cancel_delayed_work_sync(&dev->work);
 	regmap_update_bits(dev->i2s_regmap, BCM2835_I2S_CS_A_REG,
 			BCM2835_I2S_TXON | BCM2835_I2S_EN | BCM2835_I2S_STBY,
 			0);
 	bcm2835_i2s_static_stop_clock(dev);
 
-	/* Terminate any outstanding DMA and free resources */
 	if (dev->tx_chan) {
 		dmaengine_terminate_all(dev->tx_chan);
 		dma_release_channel(dev->tx_chan);
@@ -429,7 +372,6 @@ static struct platform_driver bcm2835_i2s_static_driver = {
 };
 
 module_platform_driver(bcm2835_i2s_static_driver);
-
 MODULE_DESCRIPTION("BCM2835 I2S static sample playback driver");
-MODULE_AUTHOR("GitHub Copilot");
+MODULE_AUTHOR("wwd");
 MODULE_LICENSE("GPL v2");
